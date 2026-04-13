@@ -3,36 +3,39 @@ import random
 import numpy as np
 from collections import deque
 from model import DQN
+from config import *
 
-MAX_MEMORY = 100_000
-BATCH_SIZE = 1000
-LR = 0.001
-GAMMA = 0.9
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 class Agent:
     def __init__(self):
-        self.model = DQN()
-        self.memory = deque(maxlen=MAX_MEMORY)
+        self.model = DQN().to(device)
+        self.memory = deque(maxlen=MEMORY_SIZE)
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=LR)
         self.criterion = torch.nn.MSELoss()
+
         self.epsilon = 1.0
+        self.step_count = 0  # for training frequency control
 
     def get_action(self, state):
         if random.random() < self.epsilon:
-            move = random.randint(0, 2)
-        else:
-            state = torch.tensor(state, dtype=torch.float)
+            return random.randint(0, 2)
+
+        state = torch.tensor(state, dtype=torch.float).to(device)
+        with torch.no_grad():
             q = self.model(state)
-            move = torch.argmax(q).item()
 
-        action = [0,0,0]
-        action[move] = 1
-        return action
+        return torch.argmax(q).item()
 
-    def remember(self, s, a, r, s2, done):
-        self.memory.append((s,a,r,s2,done))
+    def remember(self, s, a, r, s2, d):
+        self.memory.append((s, a, r, s2, d))
 
     def train(self):
+        # 🔹 train every few steps (speed boost)
+        self.step_count += 1
+        if self.step_count % 5 != 0:
+            return
+
         if len(self.memory) < BATCH_SIZE:
             return
 
@@ -40,25 +43,32 @@ class Agent:
 
         states, actions, rewards, next_states, dones = zip(*batch)
 
-        states = torch.tensor(states, dtype=torch.float)
-        next_states = torch.tensor(next_states, dtype=torch.float)
-        rewards = torch.tensor(rewards, dtype=torch.float)
-        dones = torch.tensor(dones, dtype=torch.bool)
+        # 🔹 fast tensor conversion
+        states = torch.tensor(np.array(states), dtype=torch.float).to(device)
+        next_states = torch.tensor(np.array(next_states), dtype=torch.float).to(device)
+        rewards = torch.tensor(rewards, dtype=torch.float).to(device)
+        dones = torch.tensor(dones, dtype=torch.bool).to(device)
+        actions = torch.tensor(actions).to(device)
 
+        # 🔹 current Q values
         pred = self.model(states)
 
+        # 🔹 next Q values (no grad)
+        with torch.no_grad():
+            next_q = self.model(next_states).max(1)[0]
+
+        # 🔹 target Q values (vectorized)
+        target_q = rewards + GAMMA * next_q * (~dones)
+
         target = pred.clone().detach()
+        target[range(BATCH_SIZE), actions] = target_q
 
-        for i in range(len(batch)):
-            Q_new = rewards[i]
-            if not dones[i]:
-                Q_new = rewards[i] + GAMMA * torch.max(self.model(next_states[i]))
-
-            target[i][torch.argmax(torch.tensor(actions[i]))] = Q_new
+        # 🔹 loss
+        loss = self.criterion(pred, target)
 
         self.optimizer.zero_grad()
-        loss = self.criterion(pred, target)
         loss.backward()
         self.optimizer.step()
 
-        self.epsilon = max(0.01, self.epsilon * 0.995)
+        # 🔹 epsilon decay
+        self.epsilon = max(EPSILON_MIN, self.epsilon * EPSILON_DECAY)
